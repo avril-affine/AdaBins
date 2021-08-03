@@ -92,8 +92,9 @@ def compute_errors(gt, pred):
     silog = np.sqrt(np.mean(err ** 2) - np.mean(err) ** 2) * 100
 
     log_10 = (np.abs(np.log10(gt) - np.log10(pred))).mean()
-    return dict(a1=a1, a2=a2, a3=a3, abs_rel=abs_rel, rmse=rmse, log_10=log_10, rmse_log=rmse_log,
+    res = dict(a1=a1, a2=a2, a3=a3, abs_rel=abs_rel, rmse=rmse, log_10=log_10, rmse_log=rmse_log,
                 silog=silog, sq_rel=sq_rel)
+    return res
 
 
 ##################################### Demo Utilities ############################################

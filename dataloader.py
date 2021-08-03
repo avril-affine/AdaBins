@@ -1,14 +1,20 @@
 # This file is mostly taken from BTS; author: Jin Han Lee, with only slight modifications
 
+import json
+import glob
 import os
 import random
 
 import numpy as np
+import torch.nn.functional as F
 import torch
 import torch.utils.data.distributed
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torchvision import transforms
+
+from project_depth import project_depth
+from synthetic_data_baselines.datasets.simplesyntheticpairs_dataset import SimpleSyntheticPairsDataSet
 
 
 def _is_pil_image(img):
@@ -25,14 +31,54 @@ def preprocessing_transforms(mode):
     ])
 
 
+class SynthDataset(Dataset):
+    def __init__(self, cfg: dict) -> None:
+        self._ds = SimpleSyntheticPairsDataSet(cfg)
+
+    def __len__(self) -> int:
+        return len(self._ds)
+
+    def __getitem__(self, idx: int) -> dict:
+        img1, img2, _, _, _, _, depth1, depth2 = self._ds[idx]
+
+        if random.random() > 0.5:
+            image, depth = img1, depth1
+        else:
+            image, depth = img2, depth2
+
+        image = torch.unsqueeze(image, 0)
+        depth = depth.permute(0, 3, 1, 2)
+        image = F.interpolate(image, (416, 544), mode="bilinear", align_corners=False)
+        depth = F.interpolate(depth, (416, 544), mode="bilinear", align_corners=False)
+        image = torch.squeeze(image, 0)
+        depth = depth[:, 0, :, :]
+
+        return {"image": image, "depth": depth, "focal": 518.8579}
+
+
 class DepthDataLoader(object):
     def __init__(self, args, mode):
+        with open("/app/synthetic_data_baselines/configs/train_changedetection.json") as f:
+            synth_cfg = json.load(f)
+            synth_cfg["train_dataset_params"]["root"] = "/app/synthetic_data_baselines/renders_multicam_diff_1"
+            synth_cfg["val_dataset_params"]["root"] = "/app/synthetic_data_baselines/renders_multicam_diff_1"
+
         if mode == 'train':
             self.training_samples = DataLoadPreprocess(args, mode, transform=preprocessing_transforms(mode))
-            if args.distributed:
-                self.train_sampler = torch.utils.data.distributed.DistributedSampler(self.training_samples)
-            else:
-                self.train_sampler = None
+            self.train_sampler = None
+
+            # XXX: SYNTH DATASET
+            if args.synth:
+                synth_ds = SynthDataset(synth_cfg["train_dataset_params"])
+                orig_len = len(self.training_samples)
+                weights = [1] * orig_len
+                weights += [orig_len / len(synth_ds)] * len(synth_ds)
+                self.training_samples = ConcatDataset([self.training_samples, synth_ds])
+                self.train_sampler = torch.utils.data.WeightedRandomSampler(weights, orig_len)
+            # if args.distributed:
+            #     self.train_sampler = torch.utils.data.distributed.DistributedSampler(self.training_samples)
+            # else:
+            #     self.train_sampler = None
 
             self.data = DataLoader(self.training_samples, args.batch_size,
                                    shuffle=(self.train_sampler is None),
@@ -42,6 +88,11 @@ class DepthDataLoader(object):
 
         elif mode == 'online_eval':
             self.testing_samples = DataLoadPreprocess(args, mode, transform=preprocessing_transforms(mode))
+
+            # XXX: SYNTH DATASET
+            # synth_ds = SimpleSyntheticPairsDataSet(synth_cfg["val_dataset_params"])
+            # self.testing_samples = ConcatDataset([self.testing_samples, synth_ds])
+
             if args.distributed:  # redundant. here only for readability and to be more explicit
                 # Give whole test set to all processes (and perform/report evaluation only on one) regardless
                 self.eval_sampler = None
@@ -71,11 +122,36 @@ class DataLoadPreprocess(Dataset):
     def __init__(self, args, mode, transform=None, is_for_online_eval=False):
         self.args = args
         if mode == 'online_eval':
-            with open(args.filenames_file_eval, 'r') as f:
-                self.filenames = f.readlines()
+            # with open(args.filenames_file_eval, 'r') as f:
+            #     filenames = f.readlines()
+            self.filenames = os.listdir(os.path.join(self.args.data_path_eval))
         else:
             with open(args.filenames_file, 'r') as f:
-                self.filenames = f.readlines()
+                filenames = f.readlines()
+            root = self.args.data_path
+            self.filenames = []
+            n_missing = 0
+            n_bad = 0
+            for f in filenames:
+                path1 = os.path.join(root, f.split()[0].lstrip("/"))
+                path2 = os.path.join(root, f.split()[1].lstrip("/"))
+                if os.path.exists(path1) and os.path.exists(path2):
+                    try:
+                        Image.open(path1)
+                        Image.open(path2)
+                    except:
+                        n_bad += 1
+                    else:
+                        self.filenames.append(f)
+                else:
+                    n_missing +=1
+            print(f"Missing: {n_missing} Bad: {n_bad}")
+
+
+        # if mode == "train":
+        #     self.filenames = glob.glob("/app/nyuv2_data/train_rgb/*.png")
+        # else:
+        #     self.filenames = glob.glob("/app/nyuv2_data/test_rgb/*.png")
 
         self.mode = mode
         self.transform = transform
@@ -84,18 +160,27 @@ class DataLoadPreprocess(Dataset):
 
     def __getitem__(self, idx):
         sample_path = self.filenames[idx]
-        focal = float(sample_path.split()[2])
+        # focal = float(sample_path.split()[2])
+        focal = 518.8579
 
         if self.mode == 'train':
             if self.args.dataset == 'kitti' and self.args.use_right is True and random.random() > 0.5:
                 image_path = os.path.join(self.args.data_path, remove_leading_slash(sample_path.split()[3]))
                 depth_path = os.path.join(self.args.gt_path, remove_leading_slash(sample_path.split()[4]))
+                # image_path = remove_leading_slash(sample_path.split()[3])
+                # depth_path = remove_leading_slash(sample_path.split()[4])
             else:
                 image_path = os.path.join(self.args.data_path, remove_leading_slash(sample_path.split()[0]))
                 depth_path = os.path.join(self.args.gt_path, remove_leading_slash(sample_path.split()[1]))
+                # image_path = remove_leading_slash(sample_path.split()[0])
+                # depth_path = remove_leading_slash(sample_path.split()[1])
+            # image_path = sample_path
+            # depth_path = image_path.replace("train_rgb", "train_depth")
 
             image = Image.open(image_path)
             depth_gt = Image.open(depth_path)
+            # depth_gt = project_depth(depth_gt)
+            # import ipdb; ipdb.set_trace()
 
             if self.args.do_kb_crop is True:
                 height = image.height
@@ -116,13 +201,18 @@ class DataLoadPreprocess(Dataset):
                 depth_gt = self.rotate_image(depth_gt, random_angle, flag=Image.NEAREST)
 
             image = np.asarray(image, dtype=np.float32) / 255.0
+            image = np.ascontiguousarray(image[:, :, ::-1])
             depth_gt = np.asarray(depth_gt, dtype=np.float32)
             depth_gt = np.expand_dims(depth_gt, axis=2)
 
-            if self.args.dataset == 'nyu':
-                depth_gt = depth_gt / 1000.0
-            else:
-                depth_gt = depth_gt / 256.0
+            # if self.args.dataset == 'nyu':
+            #     depth_gt = depth_gt / 1000.0
+            # else:
+            #     depth_gt = depth_gt / 256.0
+            depth_gt = 0.3513e3 / (1.0925e3 - depth_gt / 1000.0)  # nathan's data
+
+            depth_gt[depth_gt > self.args.max_depth] = self.args.max_depth
+            depth_gt[depth_gt < self.args.min_depth] = self.args.min_depth
 
             image, depth_gt = self.random_crop(image, depth_gt, self.args.input_height, self.args.input_width)
             image, depth_gt = self.train_preprocess(image, depth_gt)
@@ -134,15 +224,22 @@ class DataLoadPreprocess(Dataset):
             else:
                 data_path = self.args.data_path
 
-            image_path = os.path.join(data_path, remove_leading_slash(sample_path.split()[0]))
+            image_path = os.path.join(data_path, remove_leading_slash(sample_path))
+            # image_path = os.path.join(data_path, remove_leading_slash(sample_path.split()[0]))
+            # image_path = remove_leading_slash(sample_path.split()[0])
+            # image_path = sample_path
             image = np.asarray(Image.open(image_path), dtype=np.float32) / 255.0
+            image = np.ascontiguousarray(image[:, :, ::-1])
 
             if self.mode == 'online_eval':
                 gt_path = self.args.gt_path_eval
-                depth_path = os.path.join(gt_path, remove_leading_slash(sample_path.split()[1]))
+                depth_path = os.path.join(gt_path, remove_leading_slash(sample_path))
+                # depth_path = os.path.join(gt_path, remove_leading_slash(sample_path.split()[1]))
+                # depth_path = remove_leading_slash(sample_path.split()[1])
                 has_valid_depth = False
                 try:
                     depth_gt = Image.open(depth_path)
+                    # depth_gt = project_depth(depth_gt)
                     has_valid_depth = True
                 except IOError:
                     depth_gt = False
@@ -151,10 +248,16 @@ class DataLoadPreprocess(Dataset):
                 if has_valid_depth:
                     depth_gt = np.asarray(depth_gt, dtype=np.float32)
                     depth_gt = np.expand_dims(depth_gt, axis=2)
-                    if self.args.dataset == 'nyu':
-                        depth_gt = depth_gt / 1000.0
-                    else:
-                        depth_gt = depth_gt / 256.0
+                    # if self.args.dataset == 'nyu':
+                    #     depth_gt = depth_gt / 1000.0
+                    # else:
+                    #     depth_gt = depth_gt / 256.0
+                    depth_gt = 0.3513e3 / (1.0925e3 - depth_gt)  # nathan's data
+
+                    depth_gt[depth_gt > self.args.max_depth] = self.args.max_depth
+                    depth_gt[depth_gt < self.args.min_depth] = self.args.min_depth
+                else:
+                    print("NOOT HERRRRRRRRRRREEEE!!!!!!!!!!!!!")
 
             if self.args.do_kb_crop is True:
                 height = image.shape[0]
@@ -165,9 +268,15 @@ class DataLoadPreprocess(Dataset):
                 if self.mode == 'online_eval' and has_valid_depth:
                     depth_gt = depth_gt[top_margin:top_margin + 352, left_margin:left_margin + 1216, :]
 
+            depth_gt = 0.3513e3 / (1.0925e3 - depth_gt / 1000.0)  # nathan's data
+
+            depth_gt[depth_gt > self.args.max_depth] = self.args.max_depth
+            depth_gt[depth_gt < self.args.min_depth] = self.args.min_depth
+
+
             if self.mode == 'online_eval':
-                sample = {'image': image, 'depth': depth_gt, 'focal': focal, 'has_valid_depth': has_valid_depth,
-                          'image_path': sample_path.split()[0], 'depth_path': sample_path.split()[1]}
+                sample = {'image': image, 'depth': depth_gt, 'focal': focal, 'has_valid_depth': has_valid_depth,}
+                          # 'image_path': sample_path.split()[0], 'depth_path': sample_path.split()[1]}
             else:
                 sample = {'image': image, 'focal': focal}
 
@@ -249,8 +358,8 @@ class ToTensor(object):
             return {'image': image, 'depth': depth, 'focal': focal}
         else:
             has_valid_depth = sample['has_valid_depth']
-            return {'image': image, 'depth': depth, 'focal': focal, 'has_valid_depth': has_valid_depth,
-                    'image_path': sample['image_path'], 'depth_path': sample['depth_path']}
+            return {'image': image, 'depth': depth, 'focal': focal, 'has_valid_depth': has_valid_depth}
+                    # 'image_path': sample['image_path'], 'depth_path': sample['depth_path']}
 
     def to_tensor(self, pic):
         if not (_is_pil_image(pic) or _is_numpy_image(pic)):

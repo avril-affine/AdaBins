@@ -72,6 +72,8 @@ def main_worker(gpu, ngpus_per_node, args):
 
     model = models.UnetAdaptiveBins.build(n_bins=args.n_bins, min_val=args.min_depth, max_val=args.max_depth,
                                           norm=args.norm)
+    if args.pretrained:
+        model, _, _ = model_io.load_checkpoint("./AdaBins_nyu.pt", model)
 
     ################################################################################################
 
@@ -239,6 +241,7 @@ def validate(args, model, test_loader, criterion_ueff, epoch, epochs, device='cp
         val_si = RunningAverage()
         # val_bins = RunningAverage()
         metrics = utils.RunningAverageDict()
+        # for batch in tqdm(test_loader, desc=f"Epoch: {epoch + 1}/{epochs}. Loop: Validation"):
         for batch in tqdm(test_loader, desc=f"Epoch: {epoch + 1}/{epochs}. Loop: Validation") if is_rank_zero(
                 args) else test_loader:
             img = batch['image'].to(device)
@@ -263,6 +266,7 @@ def validate(args, model, test_loader, criterion_ueff, epoch, epochs, device='cp
 
             gt_depth = depth.squeeze().cpu().numpy()
             valid_mask = np.logical_and(gt_depth > args.min_depth_eval, gt_depth < args.max_depth_eval)
+            # import ipdb; ipdb.set_trace()
             if args.garg_crop or args.eigen_crop:
                 gt_height, gt_width = gt_depth.shape
                 eval_mask = np.zeros(valid_mask.shape)
@@ -314,7 +318,7 @@ if __name__ == '__main__':
                         choices=['linear', 'softmax', 'sigmoid'])
     parser.add_argument("--same-lr", '--same_lr', default=False, action="store_true",
                         help="Use same LR for all param groups")
-    parser.add_argument("--distributed", default=True, action="store_true", help="Use DDP if set")
+    parser.add_argument("--distributed", default=False, action="store_true", help="Use DDP if set")
     parser.add_argument("--root", default=".", type=str,
                         help="Root folder to save data in")
     parser.add_argument("--resume", default='', type=str, help="Resume from checkpoint")
@@ -325,9 +329,9 @@ if __name__ == '__main__':
     parser.add_argument("--workers", default=11, type=int, help="Number of workers for data loading")
     parser.add_argument("--dataset", default='nyu', type=str, help="Dataset to train on")
 
-    parser.add_argument("--data_path", default='../dataset/nyu/sync/', type=str,
+    parser.add_argument("--data_path", default='/app/nyuv2_rawdata', type=str,
                         help="path to dataset")
-    parser.add_argument("--gt_path", default='../dataset/nyu/sync/', type=str,
+    parser.add_argument("--gt_path", default='/app/nyuv2_rawdata', type=str,
                         help="path to dataset")
 
     parser.add_argument('--filenames_file',
@@ -348,9 +352,9 @@ if __name__ == '__main__':
                         action='store_true')
 
     parser.add_argument('--data_path_eval',
-                        default="../dataset/nyu/official_splits/test/",
+                        default="/app/nyuv2_data/test_rgb",
                         type=str, help='path to the data for online evaluation')
-    parser.add_argument('--gt_path_eval', default="../dataset/nyu/official_splits/test/",
+    parser.add_argument('--gt_path_eval', default="/app/nyuv2_data/test_depth",
                         type=str, help='path to the groundtruth data for online evaluation')
     parser.add_argument('--filenames_file_eval',
                         default="./train_test_inputs/nyudepthv2_test_files_with_gt.txt",
@@ -361,12 +365,15 @@ if __name__ == '__main__':
     parser.add_argument('--eigen_crop', default=True, help='if set, crops according to Eigen NIPS14',
                         action='store_true')
     parser.add_argument('--garg_crop', help='if set, crops according to Garg  ECCV16', action='store_true')
+    parser.add_argument('--synth', action='store_true')
+    parser.add_argument('--pretrained', action='store_true')
 
-    if sys.argv.__len__() == 2:
-        arg_filename_with_prefix = '@' + sys.argv[1]
-        args = parser.parse_args([arg_filename_with_prefix])
-    else:
-        args = parser.parse_args()
+    # if sys.argv.__len__() == 2:
+    #     arg_filename_with_prefix = '@' + sys.argv[1]
+    #     args = parser.parse_args([arg_filename_with_prefix])
+    # else:
+    #     args = parser.parse_args()
+    args = parser.parse_args()
 
     args.batch_size = args.bs
     args.num_threads = args.workers
